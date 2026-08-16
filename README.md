@@ -131,7 +131,7 @@ The virtual `CLAUDE.md` is a symlink to `AGENTS.md`, a virtual version of the `l
 | .claude/CLAUDE.md deleted → virtual returns | ~20 ms |
 | .claude/CLAUDE.md created → virtual withdraws | ~20 ms |
 
-For the last two: macOS remembers lookup answers (the virtual `CLAUDE.md` it served, or the "file not found" it reported) and normally reuses them without asking ClaudelessFS again, potentially forever; there is no API to clear macOS's filesystem cache. However, certain file operations force macOS to ask again, so whenever `.claude/CLAUDE.md` is created or deleted, ClaudelessFS immediately performs an invisible, no-op file operation in that directory so that macOS will ask ClaudelessFS about the existence of `CLAUDE.md` the next time a program asks for this file.
+For the last two: macOS remembers lookup answers (the virtual `CLAUDE.md` it served, or the "file not found" it reported) and normally reuses them without asking ClaudelessFS again, potentially forever; there is no API to clear macOS's filesystem cache. However, certain file operations make macOS forget its remembered answers for a specific file, so whenever `.claude/CLAUDE.md` is created or deleted, ClaudelessFS immediately performs an invisible, no-op file operation in the project's directory so that macOS will ask ClaudelessFS about the existence of `CLAUDE.md` the next time a program asks for this file.
 
 ## Known limitations
 
