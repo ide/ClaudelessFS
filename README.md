@@ -84,6 +84,7 @@ umount ~/Developer
 ## What works
 
 - Full read-write passthrough: create, write, rename, remove, symlinks, hardlinks, chmod/chown/truncate/utimes, xattrs.
+- Renaming a directory keeps everything under it working — open file descriptors, shells with their cwd inside it, and virtual CLAUDE.md files all follow the rename.
 - Open files hold a real fd, so POSIX open-time permission rules hold and git can write its read-only loose objects.
 - xattrs pass through, so macOS doesn't scatter `._` AppleDouble files.
 - The virtual file is a symlink, so writing "through" it edits AGENTS.md — the same behavior as a real `ln -s AGENTS.md CLAUDE.md`. Deleting or renaming the virtual file itself is refused, with an error that says why and what to do instead. Creating a real CLAUDE.md (or renaming one into place) works and stops synthesis.
@@ -127,14 +128,13 @@ The virtual `CLAUDE.md` is a symlink to `AGENTS.md`, a virtual version of the `l
 | AGENTS.md created → virtual CLAUDE.md appears | < 1 ms |
 | AGENTS.md deleted → virtual CLAUDE.md gone | < 1 ms |
 | real CLAUDE.md created → real file wins | < 1 ms |
-| .claude/CLAUDE.md deleted → virtual returns | < 1 ms |
-| .claude/CLAUDE.md created → virtual withdraws | next lookup, see below |
+| .claude/CLAUDE.md deleted → virtual returns | ~20 ms |
+| .claude/CLAUDE.md created → virtual withdraws | ~20 ms |
 
-If a directory is already serving the virtual link and you then create `.claude/CLAUDE.md`, the kernel keeps the cached link until it drops that vnode (memory pressure or unmount). Your new `.claude/CLAUDE.md` loads correctly either way — the residue is only that AGENTS.md content stays included alongside it. To apply the suppression immediately: `claudelessfs unmount <dir> && claudelessfs mount <dir>`.
+The last two need help, and get it automatically. The kernel caches lookups of the virtual file — positively (the link, its target, its attributes) and negatively (ENOENT) — and on a local FSKit mount those caches live until the vnode is reclaimed, which may be never; there is no invalidation API. But the kernel does drop them for namespace operations, so whenever a change flips a directory's rule, ClaudelessFS immediately nudges the kernel through its own mount: an attempted `unlink` of the virtual name evicts a link that should be gone (a link that should stay refuses the unlink and survives, and the nudge never touches real files), and a create+delete of a phantom entry — acknowledged by the extension without ever touching disk — clears a cached ENOENT so the link can reappear. No remount, nothing to run, no residue.
 
 ## Known limitations
 
-- After renaming a directory, cached items for its descendants go stale until the kernel looks them up again.
 - Covering `/` is impossible (macOS seals the system volume), and covering your home directory is disallowed (a crash would hang your session).
 
 ## Building from source

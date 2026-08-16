@@ -139,6 +139,25 @@ final class ClaudelessFS: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             return
         }
 
+        // createItem keeps an fd per new file until the kernel reclaims the
+        // item, and reclaim can lag far behind a mass creation (untar, git
+        // checkout). At the appex default of 256 descriptors that EMFILEs
+        // around file #250, so raise the limit to what the system allows.
+        var maxFilesPerProc: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        sysctlbyname("kern.maxfilesperproc", &maxFilesPerProc, &size, nil, 0)
+        var lim = rlimit()
+        if getrlimit(RLIMIT_NOFILE, &lim) == 0 {
+            let rlimInfinity = rlim_t(Int64.max) // RLIM_INFINITY, unimported by Swift
+            let target = rlim_t(max(maxFilesPerProc, 10240))
+            lim.rlim_cur = lim.rlim_max == rlimInfinity ? target : min(target, lim.rlim_max)
+            if setrlimit(RLIMIT_NOFILE, &lim) != 0 {
+                lim.rlim_cur = 10240
+                setrlimit(RLIMIT_NOFILE, &lim)
+            }
+            log.info("descriptor limit now \(lim.rlim_cur)")
+        }
+
         // Pin the source directory NOW, before any mount covers it. Every
         // volume operation resolves relative to this fd, which keeps pointing
         // at the underlying directory even when ClaudelessFS is mounted over

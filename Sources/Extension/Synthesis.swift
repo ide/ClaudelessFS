@@ -12,6 +12,10 @@ import Foundation
 enum Synthesis {
     static let virtualName = "CLAUDE.md"
     static let targetName = "AGENTS.md"
+    /// Reserved name for cache-nudge phantoms (see scheduleNudge). Creating
+    /// this name never reaches disk; it exists to make the kernel drop
+    /// negative name-cache entries in its directory.
+    static let nudgeName = ".claudelessfs-nudge"
 
     /// The virtual CLAUDE.md is a symlink to AGENTS.md — the same thing as
     /// Anthropic's documented `ln -s AGENTS.md CLAUDE.md`, synthesized. A
