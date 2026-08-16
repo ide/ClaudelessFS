@@ -140,3 +140,13 @@ For the last two: macOS remembers lookup answers (the virtual `CLAUDE.md` it ser
 ## Building from source
 
 `scripts/install.sh` runs the whole pipeline: generate the Xcode project, build, notarize, staple, install, and enable. It needs Xcode 26, `xcodegen`, an Apple Developer account (the FSKit entitlement requires a provisioning profile), and a `notarytool` keychain profile. Set `TEAM_ID` and `NOTARY_PROFILE` to yours. `scripts/uninstall.sh` reverses everything.
+
+## Releasing
+
+Releases are built on EAS, on demand — nothing runs automatically on commits to `main`. From any checkout, with an `EXPO_TOKEN` (or a logged-in `eas` CLI):
+
+```sh
+eas workflow:run .eas/workflows/release.yml -F version=0.0.2
+```
+
+The workflow (`.eas/workflows/release.yml`) runs on an EAS macOS worker: it builds and signs with the version injected as build settings (no version-bump commit), notarizes and staples, verifies with `stapler` and `spctl`, and publishes a GitHub release with the notarized `ClaudelessFS.zip` and its SHA-256. The repo is linked to the EAS project `@ide/claudelessfs` (`app.json` and `package.json` exist only for that link); signing and notarization credentials live there as secret environment variables, listed at the top of the workflow file.
