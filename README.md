@@ -131,7 +131,7 @@ The virtual `CLAUDE.md` is a symlink to `AGENTS.md`, a virtual version of the `l
 | .claude/CLAUDE.md deleted → virtual returns | ~20 ms |
 | .claude/CLAUDE.md created → virtual withdraws | ~20 ms |
 
-The last two need help, and get it automatically. The kernel caches lookups of the virtual file — positively (the link, its target, its attributes) and negatively (ENOENT) — and on a local FSKit mount those caches live until the vnode is reclaimed, which may be never; there is no invalidation API. But the kernel does drop them for namespace operations, so whenever a change flips a directory's rule, ClaudelessFS immediately nudges the kernel through its own mount: an attempted `unlink` of the virtual name evicts a link that should be gone (a link that should stay refuses the unlink and survives, and the nudge never touches real files), and a create+delete of a phantom entry — acknowledged by the extension without ever touching disk — clears a cached ENOENT so the link can reappear. No remount, nothing to run, no residue.
+For the last two: macOS remembers lookup answers — the virtual `CLAUDE.md` it served, or the "file not found" it reported — and normally repeats them without asking ClaudelessFS again, potentially forever; there is no API to make it forget. But certain file operations force it to ask again, so whenever a change flips a directory's rule, ClaudelessFS immediately performs an invisible, do-nothing file operation in that directory to trigger exactly that. It never creates, deletes, or changes anything real, and there is nothing for you to run.
 
 ## Known limitations
 
