@@ -140,3 +140,7 @@ For the last two: macOS remembers lookup answers (the virtual `CLAUDE.md` it ser
 ## Building from source
 
 `scripts/install.sh` runs the whole pipeline: generate the Xcode project, build, notarize, staple, install, and enable. It needs Xcode 26, `xcodegen`, an Apple Developer account (the FSKit entitlement requires a provisioning profile), and a `notarytool` keychain profile. Set `TEAM_ID` and `NOTARY_PROFILE` to yours. `scripts/uninstall.sh` reverses everything.
+
+## Releasing
+
+`scripts/release.sh <version>` cuts a release on demand: it sets the version in `project.yml`, builds and notarizes (`scripts/build.sh`, shared with `install.sh`), verifies the stapled app against Gatekeeper, then commits the version bump, tags `v<version>`, pushes, and publishes a GitHub release with the notarized `ClaudelessFS.zip` and its SHA-256. Run it from a clean checkout of `main`; it also needs an authenticated `gh`. Nothing is pushed until notarization succeeds, and a failed run leaves the tree clean.
