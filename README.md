@@ -101,14 +101,14 @@ umount ~/Developer
 - If the extension dies, the mount dissolves and the real files are fine.
   If a mount ever gets stuck, run: `pkill -f ClaudelessFSExtension`.
 
-## Performance, measured
+## Performance
 
-Numbers from an M-series Mac on macOS 26.5, identical trees on raw APFS vs
+These are benchmarks from a M4 Mac on macOS 26.5 comparing identical trees on plain APFS vs
 through a ClaudelessFS mount. "Warm" means the kernel answered from its
-name, attribute, or page cache without calling the extension — which is the
-steady state for everything you touch more than once.
+name, attribute, or page cache without calling the extension, which is the
+steady state for objects accessed more than once.
 
-| operation | raw APFS | through mount | overhead |
+| operation | plain APFS | through mount | overhead |
 |---|---|---|---|
 | stat a file, warm | 1.2 µs | 0.4–2.6 µs | none |
 | stat the virtual CLAUDE.md | — | 2.7 µs | — |
@@ -127,27 +127,23 @@ steady state for everything you touch more than once.
 What this means:
 
 - **Reads are effectively free.** Warm stats, opens, and reads run at native
-  speed — file opens resolve in the kernel (open/close upcalls are disabled),
+  speed. The kernel handles opening files (open/close upcalls are disabled),
   and repeated data reads come from the page cache. Warm `grep -r` over
-  2,000 files measures the same as raw APFS (0.05 s vs 0.04 s).
-- **You pay once per file**: ~50 µs on the first lookup, then it's cached.
-- **Mutations are the expensive class.** Every create, delete, and rename
+  2,000 files performs similar to plain APFS (0.05 s vs 0.04 s).
+- **One-time overhead per file**: ~50 µs on the first lookup, then it's cached.
+- **Mutations are expensive.** Every create, delete, and rename
   costs 5–9 ms: macOS turns each one into ~10 kernel↔extension round trips
   (lookups, attribute reads, and provenance-xattr writes on new files).
   `git add && git commit` of 2,000 new files: 2.2 s vs 0.16 s raw.
 
 Rule of thumb: editing, building, and running Claude Code under a mount are
 fine. Run `npm install`, large clones, or `rm -rf` of big trees outside the
-mount — unmounting and remounting costs nothing.
+mount. Unmounting to do this work and remounting later is fast.
 
-## Freshness, measured
+## Freshness
 
-The virtual CLAUDE.md is a symlink to AGENTS.md — a virtual version of
-the `ln -s AGENTS.md CLAUDE.md` that Anthropic's docs recommend. The
-predicate re-runs on every lookup, and resolving the link always goes
-through AGENTS.md's own kernel cache entry, which macOS invalidates
-correctly. Measured delay between a change and the virtual file reflecting
-it (all through the mount):
+The virtual `CLAUDE.md` is a symlink to `AGENTS.md`, a virtual version of
+the `ln -s AGENTS.md CLAUDE.md` that Anthropic's docs recommend. These are the delays between a change and the virtual file reflecting it (all through the mount):
 
 | change | takes effect in |
 |---|---|
@@ -157,7 +153,7 @@ it (all through the mount):
 | .claude/CLAUDE.md deleted → virtual returns | < 1 ms |
 | .claude/CLAUDE.md created → virtual withdraws | next lookup, see below |
 
-The one bounded imprecision: if a directory is already serving the virtual
+If a directory is already serving the virtual
 link and you then create `.claude/CLAUDE.md`, the kernel keeps the cached
 link until it drops that vnode (memory pressure or unmount). Your new
 `.claude/CLAUDE.md` loads correctly either way — the residue is only that
