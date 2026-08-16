@@ -143,4 +143,10 @@ For the last two: macOS remembers lookup answers (the virtual `CLAUDE.md` it ser
 
 ## Releasing
 
-`scripts/release.sh <version>` cuts a release on demand: it sets the version in `project.yml`, builds and notarizes (`scripts/build.sh`, shared with `install.sh`), verifies the stapled app against Gatekeeper, then commits the version bump, tags `v<version>`, pushes, and publishes a GitHub release with the notarized `ClaudelessFS.zip` and its SHA-256. Run it from a clean checkout of `main`; it also needs an authenticated `gh`. Nothing is pushed until notarization succeeds, and a failed run leaves the tree clean.
+Releases are built on EAS, on demand — nothing runs automatically on commits to `main`. From any checkout, with an `EXPO_TOKEN` (or a logged-in `eas` CLI):
+
+```sh
+eas workflow:run .eas/workflows/release.yml -F version=0.0.2
+```
+
+The workflow (`.eas/workflows/release.yml`) runs on an EAS macOS worker: it builds and signs with the version injected as build settings (no version-bump commit), notarizes and staples, verifies with `stapler` and `spctl`, and publishes a GitHub release with the notarized `ClaudelessFS.zip` and its SHA-256. The repo is linked to the EAS project `@expo-on-demand/claudelessfs` (`app.json` and `package.json` exist only for that link); signing and notarization credentials live there as secret environment variables, listed at the top of the workflow file.

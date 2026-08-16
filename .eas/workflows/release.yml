@@ -1,60 +1,88 @@
-# Build, notarize, and publish a ClaudelessFS release from EAS.
+# Build, notarize, and publish a ClaudelessFS release on an EAS macOS worker.
 #
-# Runs on an EAS macOS worker — no local Mac needed. Trigger:
-#   eas workflow:run release.yml
-# or push a tag matching v* (with the GitHub app connected).
+# Trigger on demand (CLI or API — any machine with an EXPO_TOKEN):
+#   eas workflow:run .eas/workflows/release.yml -F version=0.0.2
 #
-# Required EAS secrets (project settings → Secrets):
-#   APPLE_TEAM_ID           Apple team to sign as
-#   DEVELOPER_ID_P12        base64 of the Developer ID Application .p12
-#   DEVELOPER_ID_P12_PASSWORD
-#   ASC_KEY_P8              base64 of the App Store Connect API key (.p8)
-#   ASC_KEY_ID              its key id
-#   ASC_ISSUER_ID           its issuer id
-#   GH_TOKEN                GitHub token with releases: write
+# Required EAS environment variables (production environment, Secret
+# visibility, on the linked project @expo-on-demand/claudelessfs):
+#   APPLE_TEAM_ID              team to sign as (C8D8QTF339)
+#   DEVELOPER_ID_P12           base64 of the Developer ID Application .p12
+#   DEVELOPER_ID_P12_PASSWORD  its password
+#   ASC_KEY_P8                 base64 of an App Store Connect API key (.p8,
+#                              Admin role so it can manage provisioning)
+#   ASC_KEY_ID                 its key id
+#   ASC_ISSUER_ID              its issuer id
+#   GH_TOKEN                   GitHub token with contents write on the repo
 #
 # One ASC API key does both jobs: xcodebuild uses it to fetch/create the
-# Developer ID provisioning profile (FSKit entitlement), and notarytool
-# uses it to notarize.
+# Developer ID provisioning profile (the FSKit entitlement requires one),
+# and notarytool uses it to notarize.
 
 name: Release
+
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        description: Marketing version to release, e.g. 0.0.2
+        required: true
 
 jobs:
   release:
     name: Build, notarize, publish
     runs_on: macos-medium
     image: macos-tahoe-26.5-xcode-26.6
+    env:
+      VERSION: ${{ inputs.version }}
     steps:
       - uses: eas/checkout
-      - name: Build, notarize, publish
+
+      - name: Preflight
         run: |
           set -euo pipefail
-          brew install xcodegen gh
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "version must look like 0.0.2, got: $VERSION" >&2; exit 1 ;;
+          esac
+          command -v gh >/dev/null || brew install gh
+          command -v xcodegen >/dev/null || brew install xcodegen
+          if gh release view "v$VERSION" --repo ide/ClaudelessFS >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists" >&2; exit 1
+          fi
 
-          # Signing identity
+      - name: Import signing credentials
+        run: |
+          set -euo pipefail
+          # Developer ID identity into a throwaway keychain.
           echo "$DEVELOPER_ID_P12" | base64 -d > /tmp/devid.p12
           security create-keychain -p ci /tmp/ci.keychain
           security set-keychain-settings /tmp/ci.keychain
           security unlock-keychain -p ci /tmp/ci.keychain
           security import /tmp/devid.p12 -k /tmp/ci.keychain \
             -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k ci /tmp/ci.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci \
+            /tmp/ci.keychain >/dev/null
           security list-keychains -d user -s /tmp/ci.keychain login.keychain
-
-          # ASC API key: provisioning + notarization
+          # ASC API key: provisioning (xcodebuild) + notarization (notarytool).
           mkdir -p ~/.appstoreconnect/private_keys
-          echo "$ASC_KEY_P8" | base64 -d > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          echo "$ASC_KEY_P8" | base64 -d \
+            > ~/.appstoreconnect/private_keys/AuthKey_"$ASC_KEY_ID".p8
 
-          xcodegen generate
+      - name: Build and sign
+        run: |
+          set -euo pipefail
+          xcodegen generate --quiet
+          # Version is injected as build settings; nothing is committed back.
+          BUILD_NUMBER=$(date -u +%Y%m%d%H%M)
           xcodebuild archive \
             -project ClaudelessFS.xcodeproj -scheme ClaudelessFS \
             -configuration Release -archivePath build/ClaudelessFS.xcarchive \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             -allowProvisioningUpdates \
-            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_"$ASC_KEY_ID".p8 \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             -quiet
@@ -73,18 +101,46 @@ jobs:
             -archivePath build/ClaudelessFS.xcarchive -exportPath build/export \
             -exportOptionsPlist build/exportOptions.plist \
             -allowProvisioningUpdates \
-            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_"$ASC_KEY_ID".p8 \
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             -quiet
 
-          ditto -c -k --keepParent build/export/ClaudelessFS.app build/ClaudelessFS.zip
+      - name: Notarize and staple
+        run: |
+          set -euo pipefail
+          # Plain `zip` on purpose: ditto zips carry AppleDouble entries that
+          # the `unzip` CLI extracts as literal ._ files inside the bundle,
+          # which breaks the code signature seal.
+          (cd build/export && zip -qry ../ClaudelessFS.zip ClaudelessFS.app)
           xcrun notarytool submit build/ClaudelessFS.zip \
-            --key ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            --key ~/.appstoreconnect/private_keys/AuthKey_"$ASC_KEY_ID".p8 \
             --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" --wait
           xcrun stapler staple build/export/ClaudelessFS.app
-          ditto -c -k --keepParent build/export/ClaudelessFS.app build/ClaudelessFS.zip
+          xcrun stapler validate build/export/ClaudelessFS.app
+          spctl --assess --type execute -v build/export/ClaudelessFS.app
+          # Re-zip AFTER stapling so the release artifact carries the ticket
+          # and Gatekeeper passes offline.
+          rm -f build/ClaudelessFS.zip
+          (cd build/export && zip -qry ../ClaudelessFS.zip ClaudelessFS.app)
 
-          TAG="${GITHUB_REF_NAME:-manual-$(date +%Y%m%d%H%M)}"
-          gh release create "$TAG" build/ClaudelessFS.zip \
-            --title "ClaudelessFS $TAG" --generate-notes
+      - name: Publish GitHub release
+        run: |
+          set -euo pipefail
+          SHA256=$(shasum -a 256 build/ClaudelessFS.zip | cut -d' ' -f1)
+          gh release create "v$VERSION" build/ClaudelessFS.zip \
+            --repo ide/ClaudelessFS \
+            --target "$(git rev-parse HEAD)" \
+            --title "ClaudelessFS $VERSION" \
+            --generate-notes \
+            --notes "Notarized and stapled — download, unzip, and run:
+
+          \`\`\`sh
+          unzip ClaudelessFS.zip
+          mv ClaudelessFS.app /Applications/
+          /Applications/ClaudelessFS.app/Contents/MacOS/ClaudelessFS setup
+          \`\`\`
+
+          Then: \`claudelessfs mount <directory>\`. Requires macOS 26 on Apple Silicon.
+
+          \`ClaudelessFS.zip\` SHA-256: \`$SHA256\`"

@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "ClaudelessFS",
+    "slug": "claudelessfs",
+    "owner": "expo-on-demand",
+    "extra": {
+      "eas": {
+        "projectId": "54977cf9-0a3f-4033-883e-75f8cbe702f2"
+      }
+    }
+  }
+}
