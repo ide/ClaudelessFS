@@ -19,6 +19,24 @@ final class ClaudelessFSVolume: FSVolume {
     /// offset with it; serialize them so concurrent readers can't collide.
     private let rootEnumLock = NSLock()
 
+    /// Serial queue for kernel cache nudges (see scheduleNudge). Nudges run
+    /// after the triggering operation has replied, so the kernel never waits
+    /// on one, and this queue never blocks an FSKit operation queue.
+    private let nudgeQueue = DispatchQueue(label: "claudelessfs.nudge", qos: .utility)
+    /// Mount point resolved from the mount table on first nudge; nudgeQueue only.
+    private var cachedMountPoint: String?
+    /// Mints distinct ids for cache-nudge phantoms; guarded by cacheLock.
+    private var mintSeq: UInt64 = 0
+    /// Relpath a nudge is currently unlinking, or nil; guarded by cacheLock.
+    /// removeItem refuses to delete anything real at this path — the nudge
+    /// wants only the kernel's cache purge, never a removal.
+    private var nudgeUnlinkRelpath: String?
+
+    /// Relpaths of items whose createItem fd is (or was) held, oldest first,
+    /// so descriptor pressure can evict the fds least likely to still be
+    /// needed. Guarded by cacheLock.
+    private var heldFDOrder: [String] = []
+
     init(rootFD: Int32, volumeID: FSVolume.Identifier, volumeName: FSFileName) {
         self.rootFD = rootFD
         super.init(volumeID: volumeID, volumeName: volumeName)
@@ -94,26 +112,113 @@ final class ClaudelessFSVolume: FSVolume {
             }
             return dir
         }
+        if name == ".claude" {
+            // Renaming a whole `.claude` directory in or out (with a
+            // CLAUDE.md inside) flips the parent's synthesis without ever
+            // touching the watched file names.
+            return dir
+        }
         return nil
     }
 
     /// After a mutation that may change whether a directory synthesizes,
-    /// drop our cached synthetic item so our own answers are correct at the
-    /// very next upcall. (The kernel's attribute cache refreshes on its own
-    /// schedule; when it does, the revalidation in `attributes(for:)` gives
-    /// it the right answer.)
+    /// nudge the kernel so its caches catch up. Our own cache needs no
+    /// eviction here: lookupItem re-checks the predicate before serving the
+    /// cached item, and revalidation kills a dead item at the kernel's next
+    /// question about it. Keeping the instance alive matters — the kernel
+    /// identifies items by instance (opaque per-item file handles), and
+    /// unlink(2) internally performs two back-to-back lookups that must
+    /// resolve to the same instance; when they don't, lifs silently reports
+    /// success without removing anything.
     private func invalidateSynthesis(forMutatedRelpath relpath: String) {
         guard let dir = synthesisDirectory(forMutatedRelpath: relpath) else { return }
-        let virtualRelpath = PassthroughItem.join(dir, Synthesis.virtualName)
-        let cached: PassthroughItem? = cacheLock.withLock {
-            guard let item = itemCache[virtualRelpath], item.isSynthetic else { return nil }
-            itemCache.removeValue(forKey: virtualRelpath)
-            return item
+        log.info("synthesis inputs changed in \(dir, privacy: .public)")
+        scheduleNudge(forDirectory: dir)
+    }
+
+    /// The kernel caches lookups of the virtual CLAUDE.md — positively (the
+    /// link's vnode, attributes, and target) and negatively (ENOENT) — and
+    /// on a local FSKit mount those caches never expire on their own. So
+    /// when a mutation flips a directory's synthesis state, poke the kernel
+    /// with a no-op namespace operation through the mount:
+    ///
+    /// 1. unlink(«dir»/CLAUDE.md) evicts a cached virtual link that should
+    ///    now be gone. The kernel re-looks-up the name inside its remove;
+    ///    lookupItem answers with the same dying item (see the nudge branch
+    ///    there), removeItem confirms nothing real exists and replies
+    ///    success, and on a successful remove the kernel purges the name
+    ///    entry, cached attributes and symlink target, and recycles the
+    ///    vnode. A still-valid link refuses the unlink and survives, and
+    ///    removeItem never deletes anything real for a nudge, so this is
+    ///    safe in every state.
+    /// 2. create+unlink of a phantom entry (acknowledged by createItem and
+    ///    removeItem without touching disk) purges the directory's negative
+    ///    entries, so a virtual link that should now exist stops being
+    ///    masked by a cached ENOENT.
+    ///
+    /// Runs on nudgeQueue after the triggering operation has replied, so
+    /// even a fully serialized upcall pipeline just processes the nudge as
+    /// the next ordinary operation — no cycles, no waiting.
+    private func scheduleNudge(forDirectory dir: String) {
+        nudgeQueue.async { [weak self] in
+            guard let self, let mountPoint = self.mountPoint() else { return }
+            let dirPath = dir == "." ? mountPoint : mountPoint + "/" + dir
+            let virtualRelpath = PassthroughItem.join(dir, Synthesis.virtualName)
+            if Synthesis.shouldSynthesize(rootFD: self.rootFD, directoryRelpath: dir) {
+                let phantomPath = dirPath + "/" + Synthesis.nudgeName
+                let fd = open(phantomPath, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+                if fd >= 0 { close(fd) }
+                unlink(phantomPath)
+                log.info("nudged \(dir, privacy: .public): negative entries purged")
+            } else if statAt(self.rootFD, virtualRelpath) == nil {
+                // Only when nothing real sits at the name. (When a real
+                // CLAUDE.md just appeared there, the create or rename that
+                // put it in place already purged the kernel's entry.) The
+                // nudgeUnlinkRelpath guard makes removeItem refuse this
+                // unlink even if a real file materializes mid-flight.
+                self.cacheLock.withLock { self.nudgeUnlinkRelpath = virtualRelpath }
+                unlink(dirPath + "/" + Synthesis.virtualName)
+                self.cacheLock.withLock { self.nudgeUnlinkRelpath = nil }
+                log.info("nudged \(dir, privacy: .public): virtual link evicted")
+            }
         }
-        if let cached {
-            _ = cached
-            log.info("invalidated virtual \(virtualRelpath, privacy: .public)")
+    }
+
+    /// Where this volume is mounted, from the mount table: the claudelessfs
+    /// entry whose source (f_mntfromname, a file:// URL) resolves to the
+    /// same directory as our pinned rootFD. nudgeQueue only.
+    private func mountPoint() -> String? {
+        if let cached = cachedMountPoint { return cached }
+
+        var rootPath = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard fcntl(rootFD, F_GETPATH, &rootPath) != -1 else { return nil }
+        let rootReal = String(cString: rootPath)
+
+        var mntPtr: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo_r_np(&mntPtr, MNT_NOWAIT)
+        guard count > 0, let mounts = mntPtr else { return nil }
+        defer { free(mounts) }
+
+        func fixedString<T>(_ field: inout T) -> String {
+            withUnsafeBytes(of: &field) { raw in
+                String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
+            }
         }
+
+        for i in 0..<Int(count) {
+            var m = mounts[i]
+            guard fixedString(&m.f_fstypename) == "claudelessfs" else { continue }
+            guard let url = URL(string: fixedString(&m.f_mntfromname)), url.isFileURL
+            else { continue }
+            var resolved = [CChar](repeating: 0, count: Int(PATH_MAX))
+            guard realpath(url.path, &resolved) != nil,
+                  String(cString: resolved) == rootReal
+            else { continue }
+            let mountPoint = fixedString(&m.f_mntonname)
+            cachedMountPoint = mountPoint
+            return mountPoint
+        }
+        return nil
     }
 
     /// A synthetic item the kernel still holds may have stopped being valid
@@ -160,11 +265,35 @@ final class ClaudelessFSVolume: FSVolume {
         }
     }
 
+    /// Out of descriptors: close the oldest held createItem fds. They exist
+    /// only so writes can reach a just-created read-only file (git's 0444
+    /// loose objects), and that write follows the create within moments —
+    /// the oldest fds are long past needing it. Returns whether any closed.
+    private func evictHeldFDs() -> Bool {
+        cacheLock.withLock {
+            var closed = 0
+            while closed < 256, !heldFDOrder.isEmpty {
+                let relpath = heldFDOrder.removeFirst()
+                if let item = itemCache[relpath], item.fd >= 0 {
+                    closeHeldFDLocked(item)
+                    closed += 1
+                }
+            }
+            if closed > 0 { log.info("descriptor pressure: closed \(closed) held fds") }
+            return closed > 0
+        }
+    }
+
     // MARK: - Attributes
 
     private func attributes(for item: PassthroughItem) throws -> FSItem.Attributes {
+        if item.isPhantom { return phantomAttributes(for: item) }
         if item.isSynthetic {
-            try revalidateSynthetic(item)
+            // Skip revalidation only while our own nudge is removing this
+            // item; an ENOENT here would abort the kernel's remove before
+            // it reaches removeItem's purge-triggering success reply.
+            let dyingNudge = cacheLock.withLock { nudgeUnlinkRelpath == item.relpath }
+            if !dyingNudge { try revalidateSynthetic(item) }
             return syntheticAttributes(for: item)
         }
         guard let st = statAt(rootFD, item.relpath) else {
@@ -181,6 +310,27 @@ final class ClaudelessFSVolume: FSVolume {
         attrs.linkCount = 1
         attrs.size = size
         attrs.allocSize = size
+        attrs.fileID = item.fsIdentifier
+        attrs.uid = getuid()
+        attrs.gid = getgid()
+        var now = timespec()
+        clock_gettime(CLOCK_REALTIME, &now)
+        attrs.modifyTime = now
+        attrs.changeTime = now
+        attrs.accessTime = now
+        attrs.birthTime = now
+        return attrs
+    }
+
+    /// A cache-nudge phantom lives for the moment between its create and its
+    /// unlink; give the kernel a plausible empty file for that moment.
+    private func phantomAttributes(for item: PassthroughItem) -> FSItem.Attributes {
+        let attrs = FSItem.Attributes()
+        attrs.type = .file
+        attrs.mode = 0o600
+        attrs.linkCount = 1
+        attrs.size = 0
+        attrs.allocSize = 0
         attrs.fileID = item.fsIdentifier
         attrs.uid = getuid()
         attrs.gid = getgid()
@@ -330,6 +480,18 @@ extension ClaudelessFSVolume: FSVolume.Operations {
     ) {
         do {
             let item = try mutable(item, "change attributes of")
+            if item.isPhantom {
+                // Accept and drop whatever macOS sets on the short-lived
+                // phantom (see scheduleNudge); nothing real backs it.
+                var consumed: FSItem.Attribute = []
+                for attr in [FSItem.Attribute.mode, .uid, .gid, .size, .flags,
+                             .accessTime, .modifyTime] where newAttributes.isValid(attr) {
+                    consumed.insert(attr)
+                }
+                newAttributes.consumedAttributes = consumed
+                replyHandler(phantomAttributes(for: item), nil)
+                return
+            }
             var consumed: FSItem.Attribute = []
             // Metadata setters use the *at calls (they work on symlinks,
             // which an O_NOFOLLOW open can't). The root gets the f-variants
@@ -404,11 +566,27 @@ extension ClaudelessFSVolume: FSVolume.Operations {
         }
 
         // The real lookup failed. This is the hook.
-        if component == Synthesis.virtualName,
-           Synthesis.shouldSynthesize(rootFD: rootFD, directoryRelpath: dir.relpath) {
-            log.info("synthesized CLAUDE.md in \(dir.relpath, privacy: .public)")
-            replyHandler(syntheticItem(atRelpath: relpath, inDirectory: dir), name, nil)
-            return
+        if component == Synthesis.virtualName {
+            if Synthesis.shouldSynthesize(rootFD: rootFD, directoryRelpath: dir.relpath) {
+                let item = syntheticItem(atRelpath: relpath, inDirectory: dir)
+                log.info("synthesized CLAUDE.md in \(dir.relpath, privacy: .public)")
+                replyHandler(item, name, nil)
+                return
+            }
+            // During our own nudge-unlink, keep answering with the cached
+            // dying link: the kernel re-looks-up the name inside its remove
+            // and silently drops the whole removal if the answers don't
+            // match its vnode. Matching lets the remove reach removeItem,
+            // where replying success triggers the kernel's full purge —
+            // name-cache entry, cached attributes and symlink target, and
+            // the vnode itself.
+            let dying: PassthroughItem? = cacheLock.withLock {
+                nudgeUnlinkRelpath == relpath ? itemCache[relpath] : nil
+            }
+            if let dying, dying.isSynthetic {
+                replyHandler(dying, name, nil)
+                return
+            }
         }
 
         replyHandler(nil, nil, fs_errorForPOSIXError(ENOENT))
@@ -561,6 +739,26 @@ extension ClaudelessFSVolume: FSVolume.Operations {
             let dir = try passthrough(directory)
             guard let component = name.string else { throw fs_errorForPOSIXError(EINVAL) }
             let relpath = PassthroughItem.join(dir.relpath, component)
+
+            if component == Synthesis.nudgeName, type == .file {
+                // Cache-nudge phantom (see scheduleNudge): acknowledge the
+                // create without touching disk. The kernel entering the new
+                // name purges the directory's negative cache entries; the
+                // paired unlink follows immediately. Never cached, never
+                // enumerated, never on disk.
+                let item: PassthroughItem = cacheLock.withLock {
+                    mintSeq += 1
+                    return PassthroughItem(
+                        relpath: relpath,
+                        identifier: PassthroughItem.phantomIdentifier(sequence: mintSeq),
+                        phantom: true
+                    )
+                }
+                if newAttributes.isValid(.mode) { newAttributes.consumedAttributes.insert(.mode) }
+                replyHandler(item, name, nil)
+                return
+            }
+
             let mode = newAttributes.isValid(.mode)
                 ? mode_t(newAttributes.mode)
                 : (type == .directory ? 0o755 : 0o644)
@@ -576,6 +774,9 @@ extension ClaudelessFSVolume: FSVolume.Operations {
                 // open even when the new mode denies later opens (git creates
                 // loose objects 0444 and then writes them).
                 createdFD = openat(rootFD, relpath, O_CREAT | O_EXCL | O_RDWR, mode)
+                if createdFD < 0 && errno == EMFILE && evictHeldFDs() {
+                    createdFD = openat(rootFD, relpath, O_CREAT | O_EXCL | O_RDWR, mode)
+                }
                 guard createdFD >= 0 else { throw fs_errorForPOSIXError(errno) }
             default:
                 throw fs_errorForPOSIXError(ENOTSUP)
@@ -586,7 +787,15 @@ extension ClaudelessFSVolume: FSVolume.Operations {
                 throw fs_errorForPOSIXError(EIO)
             }
             if createdFD >= 0 {
-                cacheLock.withLock { item.fd = createdFD }
+                cacheLock.withLock {
+                    item.fd = createdFD
+                    heldFDOrder.append(relpath)
+                    // Entries whose fd has since closed linger harmlessly;
+                    // compact once in a while so the list can't grow forever.
+                    if heldFDOrder.count > 8192 {
+                        heldFDOrder = heldFDOrder.filter { (itemCache[$0]?.fd ?? -1) >= 0 }
+                    }
+                }
             }
             if newAttributes.isValid(.mode) { newAttributes.consumedAttributes.insert(.mode) }
             invalidateSynthesis(forMutatedRelpath: relpath)
@@ -632,10 +841,11 @@ extension ClaudelessFSVolume: FSVolume.Operations {
             let source = try mutable(item, "hard-link")
             let dir = try passthrough(directory)
             guard let component = name.string else { throw fs_errorForPOSIXError(EINVAL) }
-            guard linkat(rootFD, source.relpath, rootFD,
-                         PassthroughItem.join(dir.relpath, component), 0) == 0 else {
+            let relpath = PassthroughItem.join(dir.relpath, component)
+            guard linkat(rootFD, source.relpath, rootFD, relpath, 0) == 0 else {
                 throw fs_errorForPOSIXError(errno)
             }
+            invalidateSynthesis(forMutatedRelpath: relpath)
             replyHandler(name, nil)
         } catch {
             replyHandler(nil, error)
@@ -649,6 +859,38 @@ extension ClaudelessFSVolume: FSVolume.Operations {
         replyHandler: @escaping ((any Error)?) -> Void
     ) {
         do {
+            if let special = try? passthrough(item) {
+                if special.isPhantom {
+                    replyHandler(nil) // never existed on disk; nothing to do
+                    return
+                }
+                let isNudgeTarget = cacheLock.withLock {
+                    nudgeUnlinkRelpath == special.relpath
+                }
+                if special.isSynthetic {
+                    do {
+                        // A withdrawn virtual link should report ENOENT, not
+                        // the explanatory EPERM; only a still-valid link
+                        // refuses removal.
+                        try revalidateSynthetic(special)
+                    } catch {
+                        guard isNudgeTarget else { throw error }
+                        // Our own nudge reached the withdrawn link the kernel
+                        // still holds. Nothing real exists here, so report
+                        // success: the kernel purges a removed entry far more
+                        // thoroughly (name cache + vnode recycle) than a
+                        // failed one, which is the entire point of the nudge.
+                        replyHandler(nil)
+                        return
+                    }
+                }
+                // A nudge's unlink exists for its cache purge alone; if it
+                // reached something real (a CLAUDE.md that appeared while
+                // the nudge was in flight), refuse rather than delete it.
+                if isNudgeTarget && !special.isSynthetic {
+                    throw fs_errorForPOSIXError(ENOENT)
+                }
+            }
             let item = try mutable(item, "remove")
             guard let st = statAt(rootFD, item.relpath) else {
                 throw fs_errorForPOSIXError(errno)
@@ -692,11 +934,18 @@ extension ClaudelessFSVolume: FSVolume.Operations {
                 itemCache.removeValue(forKey: oldRelpath)
                 source.relpath = dstRelpath
                 itemCache[dstRelpath] = source
-                // Cached descendants of a renamed directory hold stale
-                // relpaths; drop them so fresh lookups mint fresh items.
+                // The kernel keeps using its held vnodes under a renamed
+                // directory — open fds, cwds, child lookups — without a
+                // fresh lookup, and each one routes through the same item
+                // instance. Rewrite descendant relpaths in place so every
+                // held item follows the rename instead of pointing at the
+                // old path (or worse, at whatever appears there next).
                 let prefix = oldRelpath + "/"
-                let stale = itemCache.keys.filter { $0.hasPrefix(prefix) }
-                for key in stale { itemCache.removeValue(forKey: key) }
+                for key in itemCache.keys.filter({ $0.hasPrefix(prefix) }) {
+                    guard let child = itemCache.removeValue(forKey: key) else { continue }
+                    child.relpath = dstRelpath + "/" + key.dropFirst(prefix.count)
+                    itemCache[child.relpath] = child
+                }
             }
             invalidateSynthesis(forMutatedRelpath: oldRelpath)
             invalidateSynthesis(forMutatedRelpath: dstRelpath)
@@ -721,6 +970,11 @@ extension ClaudelessFSVolume: FSVolume.ReadWriteOperations {
     ) {
         do {
             let item = try passthrough(item)
+
+            if item.isPhantom {
+                replyHandler(0, nil) // phantoms are empty
+                return
+            }
 
             if let data = item.synthetic {
                 try revalidateSynthetic(item)
@@ -758,6 +1012,10 @@ extension ClaudelessFSVolume: FSVolume.ReadWriteOperations {
     ) {
         do {
             let item = try mutable(item, "write to")
+            if item.isPhantom {
+                replyHandler(contents.count, nil) // accepted and dropped
+                return
+            }
             let written = try withFD(item, flags: O_WRONLY) { fd in
                 contents.withUnsafeBytes { raw in
                     pwrite(fd, raw.baseAddress, raw.count, offset)
@@ -846,7 +1104,7 @@ extension ClaudelessFSVolume: FSVolume.XattrOperations {
         do {
             let item = try passthrough(item)
             guard let xname = name.string else { throw fs_errorForPOSIXError(EINVAL) }
-            if item.isSynthetic { throw fs_errorForPOSIXError(ENOATTR) }
+            if item.isSynthetic || item.isPhantom { throw fs_errorForPOSIXError(ENOATTR) }
 
             let data = try withFD(item, flags: O_RDONLY) { fd -> Data in
                 let size = fgetxattr(fd, xname, nil, 0, 0, 0)
@@ -873,6 +1131,10 @@ extension ClaudelessFSVolume: FSVolume.XattrOperations {
     ) {
         do {
             let item = try mutable(item, "set an extended attribute on")
+            if item.isPhantom {
+                replyHandler(nil) // accept and drop (macOS writes provenance)
+                return
+            }
             guard let xname = name.string else { throw fs_errorForPOSIXError(EINVAL) }
 
             try withFD(item, flags: O_RDONLY) { fd in
@@ -902,7 +1164,7 @@ extension ClaudelessFSVolume: FSVolume.XattrOperations {
     ) {
         do {
             let item = try passthrough(item)
-            if item.isSynthetic {
+            if item.isSynthetic || item.isPhantom {
                 replyHandler([], nil)
                 return
             }

@@ -84,6 +84,7 @@ umount ~/Developer
 ## What works
 
 - Full read-write passthrough: create, write, rename, remove, symlinks, hardlinks, chmod/chown/truncate/utimes, xattrs.
+- Renaming a directory keeps everything under it working — open file descriptors, shells with their cwd inside it, and virtual CLAUDE.md files all follow the rename.
 - Open files hold a real fd, so POSIX open-time permission rules hold and git can write its read-only loose objects.
 - xattrs pass through, so macOS doesn't scatter `._` AppleDouble files.
 - The virtual file is a symlink, so writing "through" it edits AGENTS.md — the same behavior as a real `ln -s AGENTS.md CLAUDE.md`. Deleting or renaming the virtual file itself is refused, with an error that says why and what to do instead. Creating a real CLAUDE.md (or renaming one into place) works and stops synthesis.
@@ -127,14 +128,13 @@ The virtual `CLAUDE.md` is a symlink to `AGENTS.md`, a virtual version of the `l
 | AGENTS.md created → virtual CLAUDE.md appears | < 1 ms |
 | AGENTS.md deleted → virtual CLAUDE.md gone | < 1 ms |
 | real CLAUDE.md created → real file wins | < 1 ms |
-| .claude/CLAUDE.md deleted → virtual returns | < 1 ms |
-| .claude/CLAUDE.md created → virtual withdraws | next lookup, see below |
+| .claude/CLAUDE.md deleted → virtual returns | ~20 ms |
+| .claude/CLAUDE.md created → virtual withdraws | ~20 ms |
 
-If a directory is already serving the virtual link and you then create `.claude/CLAUDE.md`, the kernel keeps the cached link until it drops that vnode (memory pressure or unmount). Your new `.claude/CLAUDE.md` loads correctly either way — the residue is only that AGENTS.md content stays included alongside it. To apply the suppression immediately: `claudelessfs unmount <dir> && claudelessfs mount <dir>`.
+For the last two: macOS remembers lookup answers (the virtual `CLAUDE.md` it served, or the "file not found" it reported) and normally reuses them without asking ClaudelessFS again, potentially forever; there is no API to clear macOS's filesystem cache. However, certain file operations make macOS forget its remembered answers for a specific file, so whenever `.claude/CLAUDE.md` is created or deleted, ClaudelessFS immediately performs an invisible, no-op file operation in the project's directory so that macOS will ask ClaudelessFS about the existence of `CLAUDE.md` the next time a program asks for this file.
 
 ## Known limitations
 
-- After renaming a directory, cached items for its descendants go stale until the kernel looks them up again.
 - Covering `/` is impossible (macOS seals the system volume), and covering your home directory is disallowed (a crash would hang your session).
 
 ## Building from source

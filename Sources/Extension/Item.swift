@@ -26,6 +26,11 @@ final class PassthroughItem: FSItem {
     /// identifier but drops its blob and becomes a normal passthrough item.
     private(set) var synthetic: Data?
 
+    /// A cache-nudge phantom (see ClaudelessFSVolume.scheduleNudge): an item
+    /// that exists only between one createItem and the unlink that follows
+    /// it, and never touches disk. All operations on it are cheap no-ops.
+    let isPhantom: Bool
+
     /// Held fd while the kernel has the item open (openItem/closeItem), or
     /// carried over from createItem. -1 when closed. POSIX checks permissions
     /// at open time, so writes to a 0444 file the caller legitimately opened
@@ -40,10 +45,11 @@ final class PassthroughItem: FSItem {
         FSItem.Identifier(rawValue: identifier) ?? .invalid
     }
 
-    init(relpath: String, identifier: UInt64, synthetic: Data? = nil) {
+    init(relpath: String, identifier: UInt64, synthetic: Data? = nil, phantom: Bool = false) {
         self.relpath = relpath
         self.identifier = identifier
         self.synthetic = synthetic
+        self.isPhantom = phantom
         super.init()
     }
 
@@ -56,5 +62,12 @@ final class PassthroughItem: FSItem {
     /// The high bit keeps it clear of real APFS inode numbers.
     static func syntheticIdentifier(forDirectory id: UInt64) -> UInt64 {
         id | (1 << 63)
+    }
+
+    /// Id for a cache-nudge phantom. The top two bits keep it clear of both
+    /// real inode numbers and synthesized-file ids (which have bit 62
+    /// clear); `seq` keeps every phantom distinct.
+    static func phantomIdentifier(sequence seq: UInt64) -> UInt64 {
+        seq | (0b11 << 62)
     }
 }
