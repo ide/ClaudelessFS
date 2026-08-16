@@ -1,0 +1,8 @@
+*.xcodeproj/
+Sources/App/Info.plist
+Sources/App/App.entitlements
+Sources/Extension/Info.plist
+Sources/Extension/Extension.entitlements
+.DS_Store
+build/
+DerivedData/

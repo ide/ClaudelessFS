@@ -1,0 +1,75 @@
+name: ClaudelessFS
+options:
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: C8D8QTF339
+    ENABLE_HARDENED_RUNTIME: YES
+    # Apple Silicon only.
+    ARCHS: arm64
+    EXCLUDED_ARCHS: x86_64
+
+targets:
+  ClaudelessFS:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/App
+    info:
+      path: Sources/App/Info.plist
+      properties:
+        CFBundleDisplayName: ClaudelessFS
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        # No Dock icon, no windows. The executable is a CLI; the bundle
+        # exists to carry the FSKit extension.
+        LSUIElement: true
+    # No sandbox on the app: the CLI runs /sbin/mount and edits the fskit
+    # settings plist. The extension keeps its own sandbox.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: claudelessfs
+    dependencies:
+      - target: ClaudelessFSExtension
+        embed: true
+
+  ClaudelessFSExtension:
+    type: extensionkit-extension
+    platform: macOS
+    sources:
+      - Sources/Extension
+    info:
+      path: Sources/Extension/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        EXAppExtensionAttributes:
+          EXExtensionPointIdentifier: com.apple.fskit.fsmodule
+          # Without this, fskitd reports "Filesystem does not support
+          # operation mount" (mount maps to the activate operation).
+          FSActivateOptionSyntax:
+            shortOptions: "o:"
+          FSName: ClaudelessFS
+          FSShortName: claudelessfs
+          # Mount over a directory path (FSPathURLResource), not a device.
+          FSSupportsPathURLs: true
+          # true makes fskitd grant the sandboxed extension access to the
+          # source directory, even for plain /sbin/mount mounts.
+          FSRequiresSecurityScopedPathURLResources: true
+          FSPersonalities:
+            ClaudelessFSPersonality:
+              FSName: ClaudelessFS
+              FSfileObjectsAreCaseSensitive: true
+    entitlements:
+      path: Sources/Extension/Extension.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.developer.fskit.fsmodule: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: claudelessfs.FileSystemExtension

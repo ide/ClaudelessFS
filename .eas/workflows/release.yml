@@ -1,0 +1,90 @@
+# Build, notarize, and publish a ClaudelessFS release from EAS.
+#
+# Runs on an EAS macOS worker — no local Mac needed. Trigger:
+#   eas workflow:run release.yml
+# or push a tag matching v* (with the GitHub app connected).
+#
+# Required EAS secrets (project settings → Secrets):
+#   APPLE_TEAM_ID           Apple team to sign as
+#   DEVELOPER_ID_P12        base64 of the Developer ID Application .p12
+#   DEVELOPER_ID_P12_PASSWORD
+#   ASC_KEY_P8              base64 of the App Store Connect API key (.p8)
+#   ASC_KEY_ID              its key id
+#   ASC_ISSUER_ID           its issuer id
+#   GH_TOKEN                GitHub token with releases: write
+#
+# One ASC API key does both jobs: xcodebuild uses it to fetch/create the
+# Developer ID provisioning profile (FSKit entitlement), and notarytool
+# uses it to notarize.
+
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    name: Build, notarize, publish
+    runs_on: macos-medium
+    image: macos-tahoe-26.5-xcode-26.6
+    steps:
+      - uses: eas/checkout
+      - name: Build, notarize, publish
+        run: |
+          set -euo pipefail
+          brew install xcodegen gh
+
+          # Signing identity
+          echo "$DEVELOPER_ID_P12" | base64 -d > /tmp/devid.p12
+          security create-keychain -p ci /tmp/ci.keychain
+          security set-keychain-settings /tmp/ci.keychain
+          security unlock-keychain -p ci /tmp/ci.keychain
+          security import /tmp/devid.p12 -k /tmp/ci.keychain \
+            -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci /tmp/ci.keychain
+          security list-keychains -d user -s /tmp/ci.keychain login.keychain
+
+          # ASC API key: provisioning + notarization
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_KEY_P8" | base64 -d > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+
+          xcodegen generate
+          xcodebuild archive \
+            -project ClaudelessFS.xcodeproj -scheme ClaudelessFS \
+            -configuration Release -archivePath build/ClaudelessFS.xcarchive \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            -quiet
+          cat > build/exportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>developer-id</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath build/ClaudelessFS.xcarchive -exportPath build/export \
+            -exportOptionsPlist build/exportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            -quiet
+
+          ditto -c -k --keepParent build/export/ClaudelessFS.app build/ClaudelessFS.zip
+          xcrun notarytool submit build/ClaudelessFS.zip \
+            --key ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" --wait
+          xcrun stapler staple build/export/ClaudelessFS.app
+          ditto -c -k --keepParent build/export/ClaudelessFS.app build/ClaudelessFS.zip
+
+          TAG="${GITHUB_REF_NAME:-manual-$(date +%Y%m%d%H%M)}"
+          gh release create "$TAG" build/ClaudelessFS.zip \
+            --title "ClaudelessFS $TAG" --generate-notes
