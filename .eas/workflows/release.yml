@@ -4,7 +4,7 @@
 #   eas workflow:run .eas/workflows/release.yml -F version=0.0.2
 #
 # Required EAS environment variables (production environment, Secret
-# visibility, on the linked project @expo-on-demand/claudelessfs):
+# visibility, on the linked project @ide/claudelessfs):
 #   APPLE_TEAM_ID              team to sign as (C8D8QTF339)
 #   DEVELOPER_ID_P12           base64 of the Developer ID Application .p12
 #   DEVELOPER_ID_P12_PASSWORD  its password
